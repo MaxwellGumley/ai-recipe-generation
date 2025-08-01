@@ -1,28 +1,46 @@
 #!/usr/bin/env python3
 """
-bulk_mealie_import.py  —  delete-then-import with optional --token
+bulk_mealie_import.py — Delete recipes by tag, or bulk import recipes with duplicate removal
 
-• Scrapes an Apache directory index for *.html recipe files
-• For each file:
+Features
+--------
+• Delete all recipes from a Mealie server by a specific tag (`--delete-tagged`)
+• Or: Scrape an Apache directory index for *.html recipe files, and for each:
     – Downloads HTML
-    – Extracts recipe "name" from JSON-LD
-    – Searches Mealie for same name → DELETE any matches
-    – Imports via /api/recipes/create/url (includeTags=true)
+    – Extracts recipe "name" and tags from JSON-LD
+    – Only processes recipes with the specified --tag
+    – Searches Mealie for recipes with the same name and deletes any duplicates
+    – Imports recipe via /api/recipes/create/url (includeTags=true)
 
 USAGE examples
 --------------
-# 1) use env var
+# 1) Use environment variable for authentication:
 export MEALIE_TOKEN="eyJh..."
-python3 bulk_mealie_import.py --index-url https://.../recipes/ --server http://mealie:9925
+python3 bulk_mealie_import.py --index-url https://.../recipes/ --server http://mealie:9925 --tag "My Sisters' Kitchen"
 
-# 2) pass token explicitly
-python3 bulk_mealie_import.py --index-url https://.../recipes/ --server http://mealie:9925 \
-                              --token eyJh...
+# 2) Pass token explicitly:
+python3 bulk_mealie_import.py --index-url https://.../recipes/ --server http://mealie:9925 --token eyJh... --tag "My Sisters' Kitchen"
 
+# 3) Delete all recipes for a tag (no import):
+python3 bulk_mealie_import.py --server http://mealie:9925 --tag "My Sisters' Kitchen" --delete-tagged
+
+Required Arguments
+------------------
+--server      : Mealie base URL (e.g. http://host:9925)
+--tag         : Tag/group name used to filter recipes and/or delete
+
+Other Arguments
+---------------
+--index-url   : Apache directory listing containing recipe .html files (required for import, not for --delete-tagged)
+--token       : JWT token for Mealie API (can also be set via $MEALIE_TOKEN or --token-env)
+--token-env   : Name of env var for token (default: MEALIE_TOKEN)
+--delete-tagged : If set, delete ALL recipes matching the tag and exit (no import)
 """
+
 
 import argparse, html.parser, json, os, re, sys, urllib.parse, urllib.request
 import subprocess
+import re
 
 # ---------- helpers ----------
 class IndexParser(html.parser.HTMLParser):
@@ -53,6 +71,23 @@ def extract_name(html_text):
     except json.JSONDecodeError:
         return None
 
+def extract_tags(html_text):
+    m = re.search(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>',
+                  html_text, re.S | re.I)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(1))
+        keywords = data.get("keywords")
+        if isinstance(keywords, str):
+            return [s.strip() for s in re.split(r'[;,]', keywords)]
+        elif isinstance(keywords, list):
+            return keywords
+        else:
+            return []
+    except Exception:
+        return []
+
 def api_get(url, token):
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     with urllib.request.urlopen(req) as r:
@@ -78,40 +113,75 @@ def curl_import(token, server, url):
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.stdout.strip()
 
-# ---------- main ----------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--index-url", required=True,
-                    help="Directory listing URL with *.html recipes")
-    ap.add_argument("--server", required=True,
-                    help="Mealie base URL, e.g. http://host:9925")
-    ap.add_argument("--token", help="JWT token for Mealie API (optional)")
-    ap.add_argument("--token-env", default="MEALIE_TOKEN",
-                    help="Env var fallback if --token not given (default MEALIE_TOKEN)")
-    args = ap.parse_args()
+def _canon(text: str) -> str:
+    """lower-case and strip all non-alphanumerics for robust comparisons"""
+    return re.sub(r"[^a-z0-9]", "", text.lower())
 
-    token = args.token or os.getenv(args.token_env)
-    if not token:
-        sys.exit("Provide --token or set the MEALIE_TOKEN environment variable.")
+def delete_all_tagged(server: str, token: str, tag: str) -> None:
+    """Delete every recipe that carries the specified tag (name or slug)."""
+    base_api   = server.rstrip("/") + "/api/recipes"
+    page_size  = 100
+    page       = 1
+    victims    = []
+    wanted     = _canon(tag)
 
+    while True:
+        url = f"{base_api}?page={page}&perPage={page_size}"
+        print(f"[DEBUG] curl -H 'Authorization: Bearer {token}' '{url}'")
+        data = api_get(url, token)
+        items = data.get("items", [])
+        print(f"[DEBUG] Got {len(items)} items from server")
+
+        if not items:
+            break
+
+        for item in items:
+            tag_objs = item.get("tags", [])
+            # pull 'name' and 'slug' from each tag object
+            tag_texts = [t.get("name", "") for t in tag_objs] + [t.get("slug", "") for t in tag_objs]
+            if any(_canon(t) == wanted for t in tag_texts):
+                victims.append(item)
+
+        if len(items) < page_size:
+            break
+        page += 1
+
+    # --- perform deletions ---
+    for item in victims:
+        rid   = item["id"]
+        name  = item.get("name", "(unnamed)")
+        match = next(t for t in item["tags"] if _canon(t.get("name", "")) == wanted or
+                                               _canon(t.get("slug", "")) == wanted)
+        status = api_delete(f"{base_api}/{rid}", token)
+        print(f"🗑  Deleted '{name}' (id {rid}) [tag: {match['name']}] → HTTP {status}")
+
+    print(f"Deleted {len(victims)} recipes with tag '{tag}'.")
+
+
+def import_recipes(index_url, server, token, tag):
     try:
-        recipe_urls = fetch_listing(args.index_url)
+        recipe_urls = fetch_listing(index_url)
     except Exception as e:
         sys.exit(f"Unable to fetch index: {e}")
 
     if not recipe_urls:
         sys.exit("No .html files found.")
 
-    base_api = args.server.rstrip("/") + "/api/recipes"
+    base_api = server.rstrip("/") + "/api/recipes"
 
     for url in recipe_urls:
         try:
             html = urllib.request.urlopen(url).read().decode("utf-8", "ignore")
             name = extract_name(html)
+            tags = [t.strip().lower() for t in extract_tags(html)]
         except Exception as e:
             print(f"⚠️  {url}: cannot read/parse ({e})"); continue
         if not name:
             print(f"⚠️  {url}: no recipe name found"); continue
+
+        if tag.strip().lower() not in tags:
+            print(f"⚠️  {url}: tag '{tag}' not found in recipe tags/keywords: {tags}")
+            continue
 
         # delete duplicates
         try:
@@ -125,8 +195,33 @@ def main():
             print(f"⚠️  delete error for '{name}': {e}")
 
         # import fresh
-        status = curl_import(token, args.server, url)
+        status = curl_import(token, server, url)
         print(f"⬆️  Import '{name}' → HTTP {status}")
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--index-url",
+        help="Directory listing URL with *.html recipes (required unless --delete-tagged)")
+    ap.add_argument("--server", required=True,
+        help="Mealie base URL, e.g. http://host:9925")
+    ap.add_argument("--token", help="JWT token for Mealie API (optional)")
+    ap.add_argument("--token-env", default="MEALIE_TOKEN",
+        help="Env var fallback if --token not given (default MEALIE_TOKEN)")
+    ap.add_argument("--tag", required=True, help="Required tag/group name to import and/or delete (e.g. 'My Sisters'' Kitchen')")
+    ap.add_argument("--delete-tagged", action="store_true",
+        help="Delete ALL recipes with the given tag, then exit (no import)")
+    args = ap.parse_args()
+
+    token = args.token or os.getenv(args.token_env)
+    if not token:
+        sys.exit("Provide --token or set the MEALIE_TOKEN environment variable.")
+
+    if args.delete_tagged:
+        delete_all_tagged(args.server, token, args.tag)
+    else:
+        if not args.index_url:
+            sys.exit("--index-url is required unless --delete-tagged is set.")
+        import_recipes(args.index_url, args.server, token, args.tag)
 
 if __name__ == "__main__":
     main()
