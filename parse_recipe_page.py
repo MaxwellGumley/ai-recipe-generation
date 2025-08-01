@@ -47,16 +47,47 @@ Do NOT return Markdown, JSON arrays, commentary, or separators – only output t
 8. Name each file using the recipe name, all lowercase, spaces and punctuation replaced with underscores, and the .html extension.
 """
 
+def generate_menu_image_prompt(recipe_name, recipe_desc, recipe_ingredients, recipe_instructions):
+    """
+    Create an AI image prompt for a recipe website—realistic, appetizing, with only the prepared food.
+    No text, no inedible parts, everything as it would be served after following the recipe.
+    """
+    # Convert ingredients to a nicely formatted string
+    ingredients_str = ", ".join(recipe_ingredients) if recipe_ingredients else ""
+    instructions_str = " ".join(
+        step if isinstance(step, str) else step.get("text", "")
+        for step in (recipe_instructions or [])
+    )
+
+    prompt = (
+        f"High-quality, realistic photograph of the completed dish '{recipe_name}', "
+        f"as it would appear freshly prepared and ready to serve in a professional recipe website photo. "
+        f"{recipe_desc.strip() + ' ' if recipe_desc else ''}"
+        f"Show only the finished dish, attractively plated, isolated on a neutral background. "
+        f"All visible food should be fully prepared, cooked, and presented exactly as described in the recipe, "
+        f"with edible garnishes only—no text, no labels, no packaging, no kitchen tools, no hands, no inedible parts. "
+        f"For example, fruit should be sliced and hulled as needed, meat should be cooked, and no raw leaves or stems. "
+        f"Include only items from these ingredients: {ingredients_str}. "
+        f"Present the food in a way that matches the steps: {instructions_str}. "
+        f"Do not include any unrelated objects, backgrounds, or people. "
+        f"The focus should be entirely on the finished, edible dish, as it would be served."
+    )
+    return prompt
+
+
 def generate_menu_image(recipe_name, recipe_desc, recipe_ingredients, recipe_instructions, output_path, api_key):
     """
     Generate an image of the recipe using OpenAI's gpt-image-1 model.
+    Saves either by downloading from a URL or decoding base64.
     """
+    import base64
+    import requests
+    from pathlib import Path
+    import openai
+
     client = openai.OpenAI(api_key=api_key)
 
-    prompt = (
-        f"Realistic photograph of '{recipe_name}' that would be shown on a recipe website. "
-        f"{recipe_desc or ''} "
-    )
+    prompt = generate_menu_image_prompt(recipe_name, recipe_desc, recipe_ingredients, recipe_instructions)
 
     prompt_path = Path(str(output_path).replace(".png", ".prompt.txt"))
     with open(prompt_path, "w", encoding="utf-8") as f:
@@ -71,10 +102,16 @@ def generate_menu_image(recipe_name, recipe_desc, recipe_ingredients, recipe_ins
             size="1024x1024",
             quality="high"
         )
-        url = response.data[0].url
-        r = requests.get(url)
-        with open(output_path, 'wb') as f:
-            f.write(r.content)
+        data = response.data[0]
+        if getattr(data, "url", None):
+            img_bytes = requests.get(data.url).content
+        elif getattr(data, "b64_json", None):
+            img_bytes = base64.b64decode(data.b64_json)
+        else:
+            print(f"Image generation failed for {recipe_name}: No URL or base64 data returned.")
+            return
+        with open(output_path, "wb") as f:
+            f.write(img_bytes)
         print(f"✓ Image saved to {output_path}")
     except Exception as e:
         print(f"Image generation failed for {recipe_name}: {e}")
