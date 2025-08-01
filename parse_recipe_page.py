@@ -2,12 +2,10 @@
 """
 parse_recipe_page.py
 --------------------
-Usage:
-    python parse_recipe_page.py page_011.png --out-dir parsed_recipes
+Extracts recipes from a scanned cookbook page (PNG) and saves them as JSON-LD in .html files.
+Also generates a menu image for each recipe using OpenAI's gpt-image-1 model.
 
-• Reads a single PNG scan.
-• Uses OpenAI Vision (GPT-4o) to extract zero / one / many recipes.
-• Writes each extracted recipe to its own .txt file.
+Can be imported and called as a function, or run as a CLI.
 """
 
 import argparse, os, base64, json, textwrap, re, openai
@@ -49,36 +47,31 @@ Do NOT return Markdown, JSON arrays, commentary, or separators – only output t
 8. Name each file using the recipe name, all lowercase, spaces and punctuation replaced with underscores, and the .html extension.
 """
 
-def generate_menu_image(recipe_name, recipe_desc, recipe_ingredients, recipe_instructions, output_path):
-    import openai
-    import requests
-    from pathlib import Path
+def generate_menu_image(recipe_name, recipe_desc, recipe_ingredients, recipe_instructions, output_path, api_key):
+    """
+    Generate an image of the recipe using OpenAI's gpt-image-1 model.
+    """
+    client = openai.OpenAI(api_key=api_key)
 
-    client = openai.OpenAI()
-
-    # Compose the prompt
     prompt = (
         f"Realistic photograph of '{recipe_name}' that would be shown on a recipe website. "
         f"{recipe_desc or ''} "
     )
 
-    # Save the prompt as a .prompt.txt file next to the image
     prompt_path = Path(str(output_path).replace(".png", ".prompt.txt"))
     with open(prompt_path, "w", encoding="utf-8") as f:
         f.write(prompt)
     print(f"✓ Prompt saved to {prompt_path}")
 
-    # Generate image with DALL·E
     try:
         response = client.images.generate(
-            model="dall-e-3",
+            model="gpt-image-1",
             prompt=prompt,
             n=1,
             size="1024x1024",
-            quality="hd"
+            quality="high"
         )
         url = response.data[0].url
-        # Download the image
         r = requests.get(url)
         with open(output_path, 'wb') as f:
             f.write(r.content)
@@ -86,12 +79,11 @@ def generate_menu_image(recipe_name, recipe_desc, recipe_ingredients, recipe_ins
     except Exception as e:
         print(f"Image generation failed for {recipe_name}: {e}")
 
-# ---------- OpenAI API call (Vision) ----------
-def gpt4o_parse_image(image_path: str) -> str:
+def gpt4o_parse_image(image_path: str, api_key: str) -> str:
     with open(image_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode()
 
-    client = openai.OpenAI()  # Uses OPENAI_API_KEY from env
+    client = openai.OpenAI(api_key=api_key)
 
     response = client.chat.completions.create(
         model="gpt-4.1",
@@ -115,25 +107,16 @@ def gpt4o_parse_image(image_path: str) -> str:
     )
     return response.choices[0].message.content.strip()
 
-# ---------- Main CLI ----------
-def main():
-    import json
+def process_recipe_image(png_path, out_dir, api_key):
+    """
+    Parse a scanned cookbook page and write out one .html (and .png image) per recipe.
+    """
+    Path(out_dir).mkdir(exist_ok=True)
 
-    ap = argparse.ArgumentParser(
-        description="Parse one scanned cookbook PNG into recipe text file(s) "
-                    "using OpenAI Vision"
-    )
-    ap.add_argument("png", help="Path to the scanned cookbook page (PNG)")
-    ap.add_argument("--out-dir", default="recipes_parsed",
-                    help="Folder to write recipe .html and .png files")
-    args = ap.parse_args()
-
-    Path(args.out_dir).mkdir(exist_ok=True)
-
-    raw_text = gpt4o_parse_image(args.png)
+    raw_text = gpt4o_parse_image(png_path, api_key)
 
     if raw_text.lower() == "<no recipe>":
-        print(f"[{args.png}] – no recipe detected.")
+        print(f"[{png_path}] – no recipe detected.")
         return
 
     # Split raw_text into separate <script type="application/ld+json">...</script> blocks
@@ -143,7 +126,7 @@ def main():
         re.DOTALL | re.IGNORECASE
     )
     if not scripts:
-        print(f"[{args.png}] – no recipe scripts found.")
+        print(f"[{png_path}] – no recipe scripts found.")
         return
 
     for script in scripts:
@@ -166,9 +149,9 @@ def main():
             continue
 
         # Extract name and slug
-        name = recipe_data.get("name", Path(args.png).stem)
+        name = recipe_data.get("name", Path(png_path).stem)
         slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
-        out_html = Path(args.out_dir) / f"{slug}.html"
+        out_html = Path(out_dir) / f"{slug}.html"
         with open(out_html, "w", encoding="utf-8") as fp:
             fp.write(script.strip() + "\n")
         print(f"✓ Saved {out_html}")
@@ -177,16 +160,28 @@ def main():
         desc = recipe_data.get("description", "")
         ingredients = recipe_data.get("recipeIngredient", [])
         instructions = []
-        # Handles both new and old Mealie export structures
         for step in recipe_data.get("recipeInstructions", []):
             if isinstance(step, dict):
                 instructions.append(step.get("text", ""))
             elif isinstance(step, str):
                 instructions.append(step)
-        img_path = Path(args.out_dir) / f"{slug}.png"
-        generate_menu_image(name, desc, ingredients, instructions, img_path)
+        img_path = Path(out_dir) / f"{slug}.png"
+        generate_menu_image(name, desc, ingredients, instructions, img_path, api_key)
 
+def main():
+    ap = argparse.ArgumentParser(
+        description="Parse one scanned cookbook PNG into recipe text file(s) using OpenAI Vision"
+    )
+    ap.add_argument("png", help="Path to the scanned cookbook page (PNG)")
+    ap.add_argument("--out-dir", default="recipes_parsed",
+                    help="Folder to write recipe .html and .png files")
+    ap.add_argument("--api-key", default=None,
+                    help="OpenAI API key (or set OPENAI_API_KEY environment variable)")
+    args = ap.parse_args()
+    api_key = args.api_key or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        ap.error("You must provide --api-key or set OPENAI_API_KEY in the environment.")
+    process_recipe_image(args.png, args.out_dir, api_key)
 
 if __name__ == "__main__":
     main()
-
