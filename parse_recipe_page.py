@@ -13,6 +13,7 @@ Usage:
 import argparse, os, base64, json, textwrap, re, openai
 from pathlib import Path
 from PIL import Image
+import requests
 
 # ---------- Prompt sent to GPT-4o ----------
 SYSTEM_PROMPT = """
@@ -48,6 +49,42 @@ Do NOT return Markdown, JSON arrays, commentary, or separators – only output t
 8. Name each file using the recipe name, all lowercase, spaces and punctuation replaced with underscores, and the .html extension.
 """
 
+def generate_menu_image(recipe_name, recipe_desc, recipe_ingredients, recipe_instructions, output_path):
+    import openai
+    import requests
+    from pathlib import Path
+
+    client = openai.OpenAI()
+
+    # Compose the prompt
+    prompt = (
+        f"Realistic photograph of '{recipe_name}' that would be shown on a recipe website. "
+        f"{recipe_desc or ''} "
+    )
+
+    # Save the prompt as a .prompt.txt file next to the image
+    prompt_path = Path(str(output_path).replace(".png", ".prompt.txt"))
+    with open(prompt_path, "w", encoding="utf-8") as f:
+        f.write(prompt)
+    print(f"✓ Prompt saved to {prompt_path}")
+
+    # Generate image with DALL·E
+    try:
+        response = client.images.generate(
+            model="dall-e-3",
+            prompt=prompt,
+            n=1,
+            size="1024x1024",
+            quality="hd"
+        )
+        url = response.data[0].url
+        # Download the image
+        r = requests.get(url)
+        with open(output_path, 'wb') as f:
+            f.write(r.content)
+        print(f"✓ Image saved to {output_path}")
+    except Exception as e:
+        print(f"Image generation failed for {recipe_name}: {e}")
 
 # ---------- OpenAI API call (Vision) ----------
 def gpt4o_parse_image(image_path: str) -> str:
@@ -80,13 +117,15 @@ def gpt4o_parse_image(image_path: str) -> str:
 
 # ---------- Main CLI ----------
 def main():
+    import json
+
     ap = argparse.ArgumentParser(
         description="Parse one scanned cookbook PNG into recipe text file(s) "
                     "using OpenAI Vision"
     )
     ap.add_argument("png", help="Path to the scanned cookbook page (PNG)")
     ap.add_argument("--out-dir", default="recipes_parsed",
-                    help="Folder to write .txt recipe files")
+                    help="Folder to write recipe .html and .png files")
     args = ap.parse_args()
 
     Path(args.out_dir).mkdir(exist_ok=True)
@@ -98,22 +137,55 @@ def main():
         return
 
     # Split raw_text into separate <script type="application/ld+json">...</script> blocks
-    scripts = re.findall(r'(<script type="application/ld\+json">.*?</script>)', raw_text, re.DOTALL | re.IGNORECASE)
+    scripts = re.findall(
+        r'(<script type="application/ld\+json">.*?</script>)',
+        raw_text,
+        re.DOTALL | re.IGNORECASE
+    )
     if not scripts:
         print(f"[{args.png}] – no recipe scripts found.")
         return
+
     for script in scripts:
-        # Extract "name" for filename
-        m = re.search(r'"name"\s*:\s*"([^"]+)"', script)
-        if m:
-            name = m.group(1)
-            slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
-        else:
-            slug = Path(args.png).stem
-        out_path = Path(args.out_dir) / f"{slug}.html"
-        with open(out_path, "w", encoding="utf-8") as fp:
+        # Extract the JSON content from the <script> tag
+        json_match = re.search(
+            r'<script[^>]*>(.*?)</script>',
+            script,
+            re.DOTALL | re.IGNORECASE
+        )
+        if not json_match:
+            print("Warning: Could not extract JSON-LD from script.")
+            continue
+        json_ld_str = json_match.group(1).strip()
+
+        # Parse JSON-LD to dictionary
+        try:
+            recipe_data = json.loads(json_ld_str)
+        except Exception as e:
+            print(f"Error parsing JSON-LD: {e}")
+            continue
+
+        # Extract name and slug
+        name = recipe_data.get("name", Path(args.png).stem)
+        slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+        out_html = Path(args.out_dir) / f"{slug}.html"
+        with open(out_html, "w", encoding="utf-8") as fp:
             fp.write(script.strip() + "\n")
-        print(f"✓ Saved {out_path}")
+        print(f"✓ Saved {out_html}")
+
+        # Extract description, ingredients, instructions for image generation
+        desc = recipe_data.get("description", "")
+        ingredients = recipe_data.get("recipeIngredient", [])
+        instructions = []
+        # Handles both new and old Mealie export structures
+        for step in recipe_data.get("recipeInstructions", []):
+            if isinstance(step, dict):
+                instructions.append(step.get("text", ""))
+            elif isinstance(step, str):
+                instructions.append(step)
+        img_path = Path(args.out_dir) / f"{slug}.png"
+        generate_menu_image(name, desc, ingredients, instructions, img_path)
+
 
 if __name__ == "__main__":
     main()
