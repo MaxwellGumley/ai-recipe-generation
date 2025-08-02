@@ -119,7 +119,7 @@ def generate_menu_image(
             model="gpt-image-1",
             prompt=prompt,
             n=1,
-            size="1024x1024",
+            size="1536x1024",
             quality="high",
         )
         data = response.data[0]
